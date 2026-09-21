@@ -12,6 +12,8 @@ import {
 } from "../services/fastapiService.js";
 import { isMaskScanEnabled } from "../utils/scanFlags.js";
 import * as scanCache from "../utils/scanCache.js";
+import { resolveOrCreateProduct } from "../services/productService.js";
+import { generateAndUploadReport } from "../services/reportService.js";
 
 /**
  * Split the multi-megabyte annotated-image base64 out of the FastAPI OCR
@@ -36,6 +38,52 @@ function extractAnnotatedImage(ocrResult) {
   delete ocrSlim.annotated_image_base64;
   delete ocrSlim.annotated_image;
   return { annotatedBase64, ocrSlim };
+}
+
+/**
+ * Automatically creates/links the Product record in NeonDB and generates/uploads
+ * the statutory compliance report to Cloudinary, persisting it to the reports table.
+ */
+async function finalizeInspectionArtifacts({
+  inspectionId,
+  category = "general",
+  declarations = [],
+  rawOcr = {},
+  violations = [],
+  log,
+}) {
+  try {
+    const inspection = await prisma.inspection.findUnique({
+      where: { id: inspectionId },
+      include: { product: true },
+    });
+    if (!inspection) return;
+
+    let product = inspection.product;
+    if (!product) {
+      product = await resolveOrCreateProduct({
+        declarations: declarations && declarations.length ? declarations : (inspection.extractedDeclarations || []),
+        rawOcr: rawOcr && Object.keys(rawOcr).length ? rawOcr : (inspection.rawOcrOutput || {}),
+        category,
+      });
+      if (product?.id) {
+        await prisma.inspection.update({
+          where: { id: inspectionId },
+          data: { productId: product.id },
+        });
+      }
+    }
+
+    await generateAndUploadReport({
+      inspection,
+      product,
+      violations: violations || [],
+      declarations: declarations && declarations.length ? declarations : (inspection.extractedDeclarations || []),
+      category,
+    });
+  } catch (err) {
+    log?.warn?.(`Artifact finalization warning for ${inspectionId}: ${err.message}`);
+  }
 }
 
 /** Upload the annotated image to Cloudinary and return its URL (null on failure). */
@@ -217,6 +265,16 @@ async function processPhotoScan({ inspectionId, imageBuffer, filename, category 
       });
     }
 
+    // Resolve or create Product & generate Cloudinary report
+    await finalizeInspectionArtifacts({
+      inspectionId,
+      category,
+      declarations: extractedDeclarations,
+      rawOcr: ocrResult,
+      violations: violationsData,
+      log,
+    });
+
   } catch (error) {
     log.error(error);
     await prisma.inspection.update({
@@ -293,6 +351,16 @@ async function processPhotoBatch({ inspectionId, images, category = "general", l
         data: rows,
       });
     }
+
+    // Resolve or create Product & generate Cloudinary report
+    await finalizeInspectionArtifacts({
+      inspectionId,
+      category,
+      declarations: aggregated.declarations,
+      rawOcr: aggregated.rawOcr || {},
+      violations: aggregated.violations,
+      log,
+    });
   } catch (error) {
     log.error(error);
     await prisma.inspection.update({
@@ -410,6 +478,16 @@ async function processMaskedScan({ inspectionId, inputs, source, category = "gen
         data: rows,
       });
     }
+
+    // Resolve or create Product & generate Cloudinary report
+    await finalizeInspectionArtifacts({
+      inspectionId,
+      category,
+      declarations: aggregated.declarations,
+      rawOcr: { source, category, face_count: aggregated.faceImages.length },
+      violations: aggregated.violations,
+      log,
+    });
   } catch (error) {
     log.error(error);
     await prisma.inspection.update({
@@ -642,6 +720,16 @@ async function processVideoScanLegacy(req, reply) {
       });
     }
 
+    // Resolve or create Product & generate Cloudinary report
+    await finalizeInspectionArtifacts({
+      inspectionId: inspection.id,
+      category,
+      declarations: extractedDeclarations,
+      rawOcr: inspection.rawOcrOutput || {},
+      violations: violationsData,
+      log: req.log,
+    });
+
     const violations = await prisma.violation.findMany({
       where: { inspectionId: inspection.id },
     });
@@ -775,6 +863,16 @@ async function processVideoScan({ inspectionId, videoBuffer, filename, log }) {
       evidenceBbox: v.evidence_bbox || null,
     }));
     if (violationsData.length) await prisma.violation.createMany({ data: violationsData });
+
+    // Resolve or create Product & generate Cloudinary report
+    await finalizeInspectionArtifacts({
+      inspectionId,
+      category: "general",
+      declarations: extractedDeclarations,
+      rawOcr: ocrSlim || {},
+      violations: violationsData,
+      log,
+    });
   } catch (error) {
     log.error(error);
     await prisma.inspection.update({
@@ -825,6 +923,10 @@ async function getScanById(req, reply) {
       include: {
         violations: true,
         product: true,
+        reports: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+        },
         inspector: {
           select: {
             id: true,
@@ -891,6 +993,8 @@ async function getScanById(req, reply) {
       ocr_result: ocrOutput,
       extracted_declarations: inspection.extractedDeclarations,
       inspector: inspection.inspector,
+      report_url: inspection.reports?.[0]?.fileUrl || null,
+      report: inspection.reports?.[0] || null,
       violations: inspection.violations.map((v) => ({
         id: v.id,
         rule_code: v.ruleCode,
@@ -944,6 +1048,12 @@ async function listScans(req, reply) {
           complianceScore: true,
           createdAt: true,
           violations: { select: { id: true } },
+          product: true,
+          reports: {
+            take: 1,
+            orderBy: { createdAt: "desc" },
+            select: { id: true, fileUrl: true, reportType: true },
+          },
         },
       }),
     ]);
@@ -953,14 +1063,20 @@ async function listScans(req, reply) {
       limit,
       total,
       total_pages: Math.ceil(total / limit),
-      items: inspections.map((ins) => ({
-        scan_id: ins.id,
-        status: ins.status,
-        image_path: ins.imagePath,
-        compliance_score: ins.complianceScore,
-        violations_count: ins.violations.length,
-        created_at: ins.createdAt,
-      })),
+      items: inspections.map((ins) => {
+        const latestReport = ins.reports?.[0];
+        return {
+          scan_id: ins.id,
+          status: ins.status,
+          image_path: ins.imagePath,
+          compliance_score: ins.complianceScore,
+          violations_count: ins.violations.length,
+          created_at: ins.createdAt,
+          product: ins.product || null,
+          report_url: latestReport?.fileUrl || null,
+          report: latestReport || null,
+        };
+      }),
     });
   } catch (error) {
     req.log.error(error);
@@ -1004,6 +1120,62 @@ async function searchStatutoryCorpus(req, reply) {
   }
 }
 
+async function getReportByScanId(req, reply) {
+  try {
+    const { scanId } = req.params;
+    const report = await prisma.report.findFirst({
+      where: { inspectionId: scanId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!report) {
+      return reply.code(404).send({ error: "Not Found", message: "Report not found for this inspection" });
+    }
+    return reply.code(200).send(report);
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({ error: "Internal Server Error", message: err.message });
+  }
+}
+
+async function listReports(req, reply) {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const skip = (page - 1) * limit;
+
+    const [total, reports] = await Promise.all([
+      prisma.report.count(),
+      prisma.report.findMany({
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+        include: {
+          inspection: {
+            select: {
+              id: true,
+              status: true,
+              complianceScore: true,
+              imagePath: true,
+              annotatedImagePath: true,
+              product: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    return reply.code(200).send({
+      page,
+      limit,
+      total,
+      items: reports,
+    });
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({ error: "Internal Server Error", message: err.message });
+  }
+}
+
 export {
   handlePhotoScan,
   handlePhotoBatch,
@@ -1014,4 +1186,6 @@ export {
   getStatutoryCitations,
   searchStatutoryCorpus,
   extractAnnotatedImage,
+  getReportByScanId,
+  listReports,
 };

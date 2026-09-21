@@ -62,6 +62,11 @@ async function scanRoutes(fastify, options) {
   // Inspections list
   fastify.get("/inspections", scanController.listScans);
 
+  // Reports
+  fastify.get("/reports", scanController.listReports);
+  fastify.get("/reports/:scanId", scanController.getReportByScanId);
+  fastify.get("/inspections/:scanId/report", scanController.getReportByScanId);
+
   // Compliance Rules & Statutory Citations (proxied from FastAPI compute engine)
   fastify.get("/compliance/rules", scanController.getComplianceRules);
   fastify.get("/compliance/citations", scanController.getStatutoryCitations);
