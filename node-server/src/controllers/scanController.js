@@ -14,6 +14,28 @@ import { isMaskScanEnabled } from "../utils/scanFlags.js";
 import * as scanCache from "../utils/scanCache.js";
 import { resolveOrCreateProduct } from "../services/productService.js";
 import { generateAndUploadReport } from "../services/reportService.js";
+import {
+  getInspectionScope,
+  mergeScope,
+  assertInspectionAccess,
+  SecurityScopingError,
+} from "../services/dataScopingService.js";
+import { ROLES } from "../constants/rbac.js";
+
+function getScanAttributionData(user) {
+  if (!user) return {};
+  const role = (user.role || "").toUpperCase();
+  if (role === ROLES.INSPECTOR) {
+    return { inspectorId: user.id };
+  }
+  if (role === ROLES.CONSUMER) {
+    return { consumerId: user.id };
+  }
+  if (role === ROLES.MANUFACTURER) {
+    return { manufacturerId: user.organizationId || null };
+  }
+  return { inspectorId: user.id };
+}
 
 /**
  * Split the multi-megabyte annotated-image base64 out of the FastAPI OCR
@@ -348,7 +370,6 @@ async function processPhotoBatch({ inspectionId, images, category = "general", l
         data: rows,
       });
     }
-
     // Resolve or create Product & generate Cloudinary report
     await finalizeInspectionArtifacts({
       inspectionId,
@@ -475,7 +496,6 @@ async function processMaskedScan({ inspectionId, inputs, source, category = "gen
         data: rows,
       });
     }
-
     // Resolve or create Product & generate Cloudinary report
     await finalizeInspectionArtifacts({
       inspectionId,
@@ -516,7 +536,7 @@ async function handlePhotoScan(req, reply) {
     const maskEnabled = isMaskScanEnabled();
     const inspection = await prisma.inspection.create({
       data: {
-        inspectorId: req.user?.id || null,
+        ...getScanAttributionData(req.user),
         status: "PROCESSING",
         rawOcrOutput: { source: maskEnabled ? "image-masked" : "image", filename, category },
       },
@@ -565,7 +585,7 @@ async function handlePhotoBatch(req, reply) {
     const maskEnabled = isMaskScanEnabled();
     const inspection = await prisma.inspection.create({
       data: {
-        inspectorId: req.user?.id || null,
+        ...getScanAttributionData(req.user),
         status: "PROCESSING",
         rawOcrOutput: { source: maskEnabled ? "image-masked" : "image-batch", face_count: images.length, category },
       },
@@ -679,7 +699,7 @@ async function processVideoScanLegacy(req, reply) {
     // Step 4: Persist consolidated scan in DB
     const inspection = await prisma.inspection.create({
       data: {
-        inspectorId,
+        ...getScanAttributionData(req.user),
         imagePath: primaryFrame.image_url,
         annotatedImagePath: annotatedUrl,
         rawOcrOutput: {
@@ -900,7 +920,7 @@ async function handleVideoScan(req, reply) {
     const filename = data.filename || "video.mp4";
     const inspection = await prisma.inspection.create({
       data: {
-        inspectorId: req.user?.id || null,
+        ...getScanAttributionData(req.user),
         status: "PROCESSING",
         rawOcrOutput: { source: "video-masked", filename },
       },
@@ -942,6 +962,11 @@ async function getScanById(req, reply) {
         error: "Not Found",
         message: "Scan not found",
       });
+    }
+
+    // Enforce Row-Level Security Scoping if caller is authenticated
+    if (req.user) {
+      assertInspectionAccess(req.user, inspection);
     }
 
     // Old rows may still carry multi-megabyte base64 blobs in rawOcrOutput —
@@ -1007,6 +1032,13 @@ async function getScanById(req, reply) {
       })),
     });
   } catch (error) {
+    if (error instanceof SecurityScopingError) {
+      return reply.code(403).send({
+        error: "Forbidden",
+        message: error.message,
+        details: error.details,
+      });
+    }
     req.log.error(error);
     return reply.code(500).send({
       error: "Internal Server Error",
@@ -1024,9 +1056,12 @@ async function listScans(req, reply) {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
-    const where = {};
+    let where = {};
+    if (req.user) {
+      where = getInspectionScope(req.user);
+    }
     if (req.query.status) {
-      where.status = req.query.status.toUpperCase();
+      where = mergeScope(where, { status: req.query.status.toUpperCase() });
     }
 
     const [total, inspections] = await Promise.all([
@@ -1077,6 +1112,13 @@ async function listScans(req, reply) {
       }),
     });
   } catch (error) {
+    if (error instanceof SecurityScopingError) {
+      return reply.code(403).send({
+        error: "Forbidden",
+        message: error.message,
+        details: error.details,
+      });
+    }
     req.log.error(error);
     return reply.code(500).send({
       error: "Internal Server Error",
