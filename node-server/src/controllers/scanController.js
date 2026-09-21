@@ -309,12 +309,9 @@ async function processPhotoBatch({ inspectionId, images, category = "general", l
         ]);
         if (!ocr?.success) throw new Error(`OCR extraction failed for face ${faceIndex + 1}`);
         cloudinaryResult = upload;
-        ocrResult = extractAnnotatedImage(ocr).ocrSlim;
-        annotatedUrl = await hostAnnotatedImage(
-          extractAnnotatedImage(ocr).annotatedBase64,
-          filename,
-          log
-        );
+        const { annotatedBase64, ocrSlim } = extractAnnotatedImage(ocr);
+        ocrResult = ocrSlim;
+        annotatedUrl = await hostAnnotatedImage(annotatedBase64, filename, log);
         scanCache.set(imageHash, { cloudinaryResult, ocrResult, annotatedUrl });
       }
 
@@ -357,7 +354,7 @@ async function processPhotoBatch({ inspectionId, images, category = "general", l
       inspectionId,
       category,
       declarations: aggregated.declarations,
-      rawOcr: aggregated.rawOcr || {},
+      rawOcr: {},
       violations: aggregated.violations,
       log,
     });
@@ -819,9 +816,10 @@ async function processVideoScan({ inspectionId, videoBuffer, filename, log }) {
     );
 
     const primaryFrame = uploadedFrames[0];
+    const category = "general";
     const fullOcrResult = await runOcr(primaryFrame.buffer, primaryFrame.filename);
     if (!fullOcrResult?.success) throw new Error("OCR extraction failed for video frame");
-    const complianceResult = await evaluateOcrCompliance(fullOcrResult);
+    const complianceResult = await evaluateOcrCompliance(fullOcrResult, category);
     const { annotatedBase64, ocrSlim } = extractAnnotatedImage(fullOcrResult);
     const annotatedUrl = await hostAnnotatedImage(annotatedBase64, primaryFrame.filename, log);
     const extractedDeclarations = (complianceResult.summary?.what_was_found || []).map((d) => ({
@@ -867,7 +865,7 @@ async function processVideoScan({ inspectionId, videoBuffer, filename, log }) {
     // Resolve or create Product & generate Cloudinary report
     await finalizeInspectionArtifacts({
       inspectionId,
-      category: "general",
+      category,
       declarations: extractedDeclarations,
       rawOcr: ocrSlim || {},
       violations: violationsData,
@@ -986,7 +984,7 @@ async function getScanById(req, reply) {
       product: inspection.product || null,
       image_path: inspection.imagePath,
       annotated_image_path: inspection.annotatedImagePath || null,
-      annotated_image_base64: inspection.rawOcrOutput?.annotated_image_base64 || null,
+      annotated_image_base64: null, // stripped; use annotated_image_path URL instead
       face_images: faceImages,
       created_at: inspection.createdAt,
       compliance_score: inspection.complianceScore,

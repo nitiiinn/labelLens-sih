@@ -1265,7 +1265,7 @@ class ComplianceEvaluator:
         """Estimates physical font height in mm based on pixel scaling."""
         # Standard packaging photo physical height ~150mm
         est_mm = (font_size_px / max(img_height_px, 1)) * 150.0
-        return round(max(est_mm, 1.0), 1)
+        return round(est_mm, 1)
 
 
 # Helper function to evaluate image compliance directly
