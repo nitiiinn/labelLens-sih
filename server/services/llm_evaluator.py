@@ -289,7 +289,7 @@ class LLMComplianceEvaluator:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
-            "max_tokens": 2048
+            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "600"))
         }
 
         try:
@@ -403,6 +403,31 @@ class LLMComplianceEvaluator:
                                 field_name=field_name,
                                 description=rule_meta.get("description", ""),
                                 required=rule_meta.get("required", True),
+                                citation=citation
+                            )
+                        )
+                    else:
+                        confidence = round(matched_block.confidence, 2) if (matched_block and matched_block.confidence) else 0.95
+                        font_size_px = (
+                            matched_block.size.estimated_font_size_px
+                            if (matched_block and hasattr(matched_block, "size") and matched_block.size and matched_block.size.estimated_font_size_px)
+                            else 20.0
+                        )
+                        img_h = ocr_result.image_metadata.height if (ocr_result and ocr_result.image_metadata and ocr_result.image_metadata.height) else 1000
+                        font_size_mm_est = round(max((font_size_px / max(img_h, 1)) * 150.0, 1.0), 1)
+                        found_declarations.append(
+                            DeclarationFound(
+                                id=rid,
+                                field_name=field_name,
+                                extracted_text=ev.exact_quote or ev.detected_on_package or ev.extracted_value or "",
+                                parsed_value=ev.extracted_value or ev.detected_on_package,
+                                confidence=confidence,
+                                bbox=bbox,
+                                font_size_px=font_size_px,
+                                font_size_mm_est=font_size_mm_est,
+                                format_valid=False,
+                                size_valid=ev.violation_type != "too_small",
+                                status="FAIL",
                                 citation=citation
                             )
                         )
