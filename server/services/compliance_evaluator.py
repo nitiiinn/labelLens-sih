@@ -5,7 +5,12 @@ import uuid
 import base64
 import logging
 from typing import List, Dict, Any, Optional
-from PIL import Image, ImageDraw
+
+try:
+    from PIL import Image, ImageDraw  # type: ignore
+except ImportError:
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
 
 from schemas.ocr import OCRScanResult, TextBlock, BBox
 from schemas.compliance import (
@@ -123,7 +128,7 @@ CATEGORY_RULE_PATTERNS = {
     },
     "unit_sale_price": {
         "keywords": ["UNIT SALE PRICE", "UNIT PRICE", "USP", "PRICE PER"],
-        "regex": r"(?:USP|UNIT\s*SALE\s*PRICE|UNIT\s*PRICE)[^\d]*[\d,]+(?:\.\d{1,2})?"
+        "regex": r"(?:(?:RS\.?|₹|INR)\s*)?\d+(?:\.\d{1,2})?\s*(?:/|PER\s+)(?:G|GM|GMS|KG|KGS|ML|MLS|L|LTR|LTRS|LITRE|LITER|N|U|PCS|PIECE|PIECES|NUMBER|TABLET|TABLETS|SACHET|SACHETS|UNIT|UNITS)\b"
     },
     "pan_masala_warning": {
         "keywords": ["CHEWING OF PAN MASALA", "INJURIOUS TO HEALTH", "PAN MASALA", "GUTKHA", "HEALTH WARNING"],
@@ -224,6 +229,17 @@ def has_tax_clause(norm: str) -> bool:
 
 # Currency token as a WORD (plus the glued "Rs250" spelling OCR often produces).
 _CURRENCY_RE = re.compile(r"₹|\bINR\b|\bRS\b|\bRS(?=[.\d])")
+
+# Unit Sale Price rate expressions (e.g. RS.10.00/N, Rs. 5/g, 10.00/N, ₹10/pcs)
+_UNIT_SALE_PRICE_RATE_RE = re.compile(
+    r'(?:(?:RS\.?|₹|INR)\s*)?\d+(?:\.\d{1,2})?\s*(?:/|PER\s+)(?:G|GM|GMS|KG|KGS|ML|MLS|L|LTR|LTRS|LITRE|LITER|N|U|PCS|PIECE|PIECES|NUMBER|TABLET|TABLETS|SACHET|SACHETS|UNIT|UNITS)\b',
+    re.IGNORECASE
+)
+_USP_KEYWORD_RE = re.compile(r'\b(?:USP|UNIT\s*SALE\s*PRICE|UNIT\s*PRICE)\b', re.IGNORECASE)
+_USP_POINTER_RE = re.compile(
+    r'(?:UNIT\s*SALE\s*PRICE|UNIT\s*PRICE|USP)[^\n.]*(?:SEE\s+(?:ABOVE|BELOW|ON|PANEL|STAMP)|AS\s+ABOVE)',
+    re.IGNORECASE
+)
 
 _QUANTITY_RE = re.compile(r"(?:\b\d+\s*[NnUu]?\s*[xX*]\s*\d+(?:\.\d+)?\s*(?:G|KG|ML|L|GM|GMS|LTRS|N|U)?\b|\b\d+(?:\.\d+)?\s*(G|KG|ML|L|N|GM|GMS|LTRS|U)\b)")
 # Deliberately restricted to '/' and '-' separators: allowing '.' would make the price
@@ -351,6 +367,57 @@ class ComplianceEvaluator:
                         if not v.citation:
                             v.citation = citation_svc.get_citation(v.rule_id)
 
+                    # Reconcile Unit Sale Price: Contextual understanding beyond literal keyword matching.
+                    # Packaged goods often declare USP as a price-per-unit on batch stickers (e.g. RS.10.00/N)
+                    # and/or refer to it via pointer text ("Unit Sale Price, please see above").
+                    usp_rate_match = None
+                    usp_rate_block = None
+                    for b in ocr_result.text_blocks:
+                        m_usp = _UNIT_SALE_PRICE_RATE_RE.search(flatten_text(b.text))
+                        if m_usp:
+                            usp_rate_match = m_usp.group(0)
+                            usp_rate_block = b
+                            break
+
+                    doc_text = self._document_text(ocr_result)
+                    has_usp_pointer = bool(_USP_POINTER_RE.search(doc_text))
+
+                    if usp_rate_match or has_usp_pointer:
+                        missing_usp = [m for m in llm_result.summary.whats_missing if m.id == "unit_sale_price"]
+                        if missing_usp:
+                            llm_result.summary.whats_missing = [m for m in llm_result.summary.whats_missing if m.id != "unit_sale_price"]
+                            llm_result.compliance_score = min(round(llm_result.compliance_score + 10.0, 1), 100.0)
+
+                        llm_result.summary.whats_wrong = [
+                            v for v in llm_result.summary.whats_wrong 
+                            if v.rule_id != "unit_sale_price" or v.violation_type not in ("missing", "not_found")
+                        ]
+
+                        if not any(d.id == "unit_sale_price" for d in llm_result.summary.what_was_found):
+                            extracted_usp = usp_rate_match or "Unit Sale Price (Declared via package pointer)"
+                            best_bbox = usp_rate_block.bbox if usp_rate_block else next(
+                                (b.bbox for b in ocr_result.text_blocks if _USP_POINTER_RE.search(flatten_text(b.text))),
+                                None
+                            )
+                            font_px = usp_rate_block.size.estimated_font_size_px if usp_rate_block else 16.0
+                            llm_result.summary.what_was_found.append(DeclarationFound(
+                                id="unit_sale_price",
+                                field_name="Unit Sale Price",
+                                extracted_text=extracted_usp,
+                                parsed_value=usp_rate_match or extracted_usp,
+                                confidence=0.95,
+                                bbox=best_bbox,
+                                font_size_px=font_px,
+                                font_size_mm_est=self._estimate_font_mm(font_px, ocr_result.image_metadata.height),
+                                format_valid=True,
+                                size_valid=True,
+                                status="COMPLIANT",
+                                citation=citation_svc.get_citation("unit_sale_price")
+                            ))
+
+                        if not llm_result.summary.whats_wrong and not llm_result.summary.whats_missing:
+                            llm_result.overall_result = "PASS"
+
                     if image_bytes:
                         evidence_b64 = self.generate_violation_evidence_image(
                             image_bytes,
@@ -378,6 +445,7 @@ class ComplianceEvaluator:
 
         # Build dynamic matchers for all rules present in active ruleset
         standard_map = {
+            "unit_sale_price": (self._is_unit_sale_price, lambda b: self._eval_unit_sale_price(b, img_height, doc_norm, all_blocks=blocks)),
             "mrp": (self._is_mrp, lambda b: self._eval_mrp(b, ocr_result, doc_norm)),
             "net_quantity": (self._is_net_quantity, lambda b: self._eval_net_quantity(b, img_height, doc_norm, all_blocks=blocks)),
             "manufacture_date": (self._is_mfg_date, lambda b: self._eval_mfg_date(b, img_height)),
@@ -739,6 +807,8 @@ class ComplianceEvaluator:
         flat = flatten_text(text)
         if rule_id == "mrp":
             return bool(re.search(r"\d", flat))
+        if rule_id == "unit_sale_price":
+            return bool(_UNIT_SALE_PRICE_RATE_RE.search(flat)) or bool(re.search(r"\d", flat))
         if rule_id == "net_quantity":
             return bool(_QUANTITY_RE.search(flat))
         if rule_id == "manufacture_date":
@@ -767,11 +837,9 @@ class ComplianceEvaluator:
             keywords = [clean_name]
 
         def detector(text: str) -> bool:
-            t_upper = text.upper()
             if rule_id == "unit_sale_price":
-                has_unit_rate = bool(re.search(r"(?:/|PER\s+)(?:G|GM|KG|ML|L|LTR|N|U|PIECE|NUMBER|TABLET)\b", t_upper))
-                if not (has_unit_rate and re.search(r"\d", text)):
-                    return False
+                return self._is_unit_sale_price(text)
+            t_upper = text.upper()
             if custom_regex and re.search(custom_regex, text, re.IGNORECASE):
                 return True
             return any(kw in t_upper for kw in keywords)
@@ -831,13 +899,24 @@ class ComplianceEvaluator:
 
     # --- Entity Detection Helpers (Brand-Agnostic & Fully Generalized) ---
 
+    def _is_unit_sale_price(self, text: str) -> bool:
+        flat = flatten_text(text)
+        if _UNIT_SALE_PRICE_RATE_RE.search(flat):
+            return True
+        if _USP_POINTER_RE.search(flat):
+            return True
+        if _USP_KEYWORD_RE.search(flat) and re.search(r"\d", flat):
+            return True
+        return False
+
     def _is_mrp(self, text: str) -> bool:
         norm = normalize_phrase(text)
+        flat = flatten_text(text)
+        # Unit sale price declarations (e.g. "RS.10.00/N") must NEVER be captured as MRP!
+        if self._is_unit_sale_price(text) and not (_has_keyword(norm, _MRP_KEYWORDS) or has_tax_clause(norm)):
+            return False
         if _has_keyword(norm, _MRP_KEYWORDS) or has_tax_clause(norm):
             return True
-        # A bare price only counts as MRP when the currency token stands as its own word;
-        # plain "RS" substring matching also fires on words like CUSTOMERS.
-        flat = flatten_text(text)
         return bool(_CURRENCY_RE.search(flat)) and bool(re.search(r"\d", flat))
 
     _NUTRITION_TERMS = {"ENERGY", "PROTEIN", "CARBOHYDRATE", "FAT", "SUGAR", "SUGARS", "KCAL", "NUTRITION", "NUTRITIONAL", "SERVING"}
@@ -1010,6 +1089,68 @@ class ComplianceEvaluator:
             extracted_text=text,
             parsed_value=text,
             confidence=block.confidence,
+            bbox=block.bbox,
+            font_size_px=block.size.estimated_font_size_px,
+            font_size_mm_est=font_size_mm,
+            format_valid=format_valid,
+            size_valid=size_valid,
+            status=status
+        )
+        return decl, viols
+
+    def _eval_unit_sale_price(self, block: TextBlock, img_height: int, doc_norm: Optional[str] = None,
+                              all_blocks: Optional[List[TextBlock]] = None) -> tuple[DeclarationFound, List[ViolationDetail]]:
+        text = block.text.strip()
+        flat = flatten_text(text)
+
+        extracted_rate = None
+        m_rate = _UNIT_SALE_PRICE_RATE_RE.search(flat)
+        if m_rate:
+            extracted_rate = m_rate.group(0)
+        elif all_blocks:
+            for other_b in all_blocks:
+                if other_b.id == block.id:
+                    continue
+                other_flat = flatten_text(other_b.text)
+                m_other = _UNIT_SALE_PRICE_RATE_RE.search(other_flat)
+                if m_other:
+                    extracted_rate = m_other.group(0)
+                    text = f"{extracted_rate} (via '{text}')"
+                    break
+
+        if not extracted_rate and doc_norm:
+            m_doc = _UNIT_SALE_PRICE_RATE_RE.search(doc_norm)
+            if m_doc:
+                extracted_rate = m_doc.group(0)
+                text = f"{extracted_rate} (referenced on package)"
+
+        final_extracted = extracted_rate or text
+
+        min_font = self._get_min_font_size("unit_sale_price", 1.0)
+        font_size_mm = self._estimate_font_mm(block.size.estimated_font_size_px, img_height)
+        size_valid = font_size_mm >= min_font
+        format_valid = bool(extracted_rate or _USP_POINTER_RE.search(flat))
+
+        viols: List[ViolationDetail] = []
+        if not size_valid:
+            viols.append(ViolationDetail(
+                id=f"viol_usp_font_{block.id}",
+                rule_id="unit_sale_price",
+                field_name=self.rule_map.get("unit_sale_price", {}).get("field_name", "Unit Sale Price"),
+                violation_type="too_small",
+                severity="MINOR",
+                description=f"Unit Sale Price font size ({font_size_mm:.1f}mm) is below minimum prescribed ({min_font:.1f}mm).",
+                evidence_bbox=block.bbox
+            ))
+
+        status = "COMPLIANT" if (format_valid and size_valid) else ("FORMAT_ERROR" if not format_valid else "TOO_SMALL")
+
+        decl = DeclarationFound(
+            id="unit_sale_price",
+            field_name=self.rule_map.get("unit_sale_price", {}).get("field_name", "Unit Sale Price"),
+            extracted_text=final_extracted,
+            parsed_value=extracted_rate or final_extracted,
+            confidence=round(block.confidence, 2),
             bbox=block.bbox,
             font_size_px=block.size.estimated_font_size_px,
             font_size_mm_est=font_size_mm,
